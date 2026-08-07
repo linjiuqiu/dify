@@ -632,7 +632,7 @@ class TraceTask:
             return {}
         conversation_mode = conversation_mode[0]
         created_at = message_data.created_at
-        inputs = message_data.message
+        inputs = message_data.query or message_data.message
 
         # get message file data
         message_file_data = db.session.query(MessageFile).filter_by(message_id=message_id).first()

@@ -22,11 +22,13 @@ from core.app.entities.queue_entities import (
 from core.app.features.annotation_reply.annotation_reply import AnnotationReplyFeature
 from core.moderation.base import ModerationError
 from core.moderation.input_moderation import InputModeration
+from core.moderation.output_moderation import ModerationRule, OutputModeration
 from core.variables.variables import VariableUnion
 from core.workflow.enums import WorkflowType
 from core.workflow.graph_engine.command_channels.redis_channel import RedisChannel
 from core.workflow.graph_engine.layers.base import GraphEngineLayer
 from core.workflow.graph_engine.layers.persistence import PersistenceWorkflowInfo, WorkflowPersistenceLayer
+from core.workflow.graph_events import GraphRunPartialSucceededEvent, GraphRunSucceededEvent
 from core.workflow.repositories.workflow_execution_repository import WorkflowExecutionRepository
 from core.workflow.repositories.workflow_node_execution_repository import WorkflowNodeExecutionRepository
 from core.workflow.runtime import GraphRuntimeState, VariablePool
@@ -81,10 +83,12 @@ class AdvancedChatAppRunner(WorkflowBasedAppRunner):
         self._app = app
         self._workflow_execution_repository = workflow_execution_repository
         self._workflow_node_execution_repository = workflow_node_execution_repository
+        self._workflow_finished_successfully = False
 
     @trace_span(WorkflowAppRunnerHandler)
     def run(self):
         run_started_at = time.perf_counter()
+        self._workflow_finished_successfully = False
         app_config = self.application_generate_entity.app_config
         app_config = cast(AdvancedChatAppConfig, app_config)
 
@@ -209,8 +213,14 @@ class AdvancedChatAppRunner(WorkflowBasedAppRunner):
 
         for event in generator:
             self._handle_event(workflow_entry, event)
+            if isinstance(event, (GraphRunSucceededEvent, GraphRunPartialSucceededEvent)):
+                self._workflow_finished_successfully = True
 
-        self._backfill_message_answer(graph_runtime_state, run_started_at)
+        # Only backfill when the workflow reached a success terminal state. The
+        # request thread may have died (client disconnected) before the workflow
+        # completed, so it cannot persist the answer; the worker thread does it here.
+        if self._workflow_finished_successfully:
+            self._backfill_message_answer(graph_runtime_state, run_started_at)
 
     def _backfill_message_answer(
         self, graph_runtime_state: GraphRuntimeState, run_started_at: float | None = None
@@ -225,14 +235,30 @@ class AdvancedChatAppRunner(WorkflowBasedAppRunner):
         answer and usage metrics are persisted regardless of the client connection
         state. It only updates the message when the answer is still empty, leaving
         already-persisted answers untouched.
+
+        The answer still goes through output moderation before being persisted, and
+        the workflow run id is persisted as well so log systems can correlate the
+        message even when the request thread never consumed the workflow start event.
         """
         outputs = graph_runtime_state.outputs or {}
         answer = outputs.get("answer")
         if not isinstance(answer, str) or not answer.strip():
             return
 
+        app_config = cast(AdvancedChatAppConfig, self.application_generate_entity.app_config)
+        sensitive_word_avoidance = app_config.sensitive_word_avoidance
+        if sensitive_word_avoidance:
+            output_moderation = OutputModeration(
+                tenant_id=app_config.tenant_id,
+                app_id=app_config.app_id,
+                rule=ModerationRule(type=sensitive_word_avoidance.type, config=sensitive_word_avoidance.config),
+                queue_manager=self._queue_manager,
+            )
+            answer, _ = output_moderation.moderation_completion(completion=answer, public_event=False)
+
         values: dict[str, Any] = {
             "answer": answer,
+            "workflow_run_id": self.application_generate_entity.workflow_run_id,
             "updated_at": naive_utc_now(),
         }
 
